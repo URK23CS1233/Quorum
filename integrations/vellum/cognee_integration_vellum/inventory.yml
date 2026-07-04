@@ -1,0 +1,14 @@
+# Cognee integrations inventory
+# Each entry tracks ownership, package name, and language for CI automation.
+
+integrations:
+  - name: vellum
+    package: cognee-integration-vellum
+    language: python
+    status: active
+    owner: URK23CS1233
+    pypi: cognee-integration-vellum
+    description: >
+      Persistent graph memory nodes and drift detection for Vellum Workflows.
+      Adds CogneeRememberNode, CogneeRecallNode, and CogneeMemoryDriftNode
+      as typed BaseNode subclasses visible in the Vellum visual editor.

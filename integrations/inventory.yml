@@ -1,0 +1,19 @@
+# Cognee Integrations Inventory
+# Tracks all known integrations with ownership, language, and package info.
+# CI auto-detects packages by pyproject.toml / package.json presence —
+# this file adds human-readable metadata and is updated when adding integrations.
+
+integrations:
+  - name: vellum
+    package: cognee-integration-vellum
+    language: python
+    status: active
+    owner: URK23CS1233
+    pypi: cognee-integration-vellum
+    path: integrations/vellum
+    description: >
+      Persistent graph memory nodes and hallucination drift detection for
+      Vellum Workflows. Adds CogneeRememberNode, CogneeRecallNode, and
+      CogneeMemoryDriftNode as typed BaseNode subclasses visible in the
+      Vellum visual editor. MemoryScope enum provides workflow, user, and
+      global dataset isolation out of the box.
