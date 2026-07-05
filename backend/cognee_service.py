@@ -7,6 +7,11 @@ graph-vector store. When production breaks, Quorum traverses the
 graph to recall matching patterns and surface the safe state.
 """
 
+import os
+# Silence cognee's PostHog telemetry (otherwise every ingest spams the log with
+# eu.i.posthog.com read-timeouts and stalls the request). Must be set before import.
+os.environ.setdefault("TELEMETRY_DISABLED", "1")
+
 import cognee
 import json
 import logging
@@ -39,6 +44,12 @@ def _save_registry(registry: dict[str, dict]):
 _deployment_cache: dict[str, Deployment] | None = None
 _last_stable_deployment: Deployment | None = None
 
+# Whether Cognee's graph pipeline (LLM entity extraction + embeddings) can run.
+# Groq cannot: cognee 0.1.17's cognify has a litellm code path that ignores the
+# custom endpoint and 401s against OpenAI. When disabled we skip the graph
+# entirely (registry-only) so ingestion stays instant instead of retry-storming.
+_graph_enabled: bool = False
+
 def _get_registry() -> dict[str, Deployment]:
     global _deployment_cache
     if _deployment_cache is None:
@@ -47,15 +58,63 @@ def _get_registry() -> dict[str, Deployment]:
     return _deployment_cache
 
 
+def _use_local_embeddings(model: str, dims: int) -> None:
+    """
+    Point Cognee at a local Fastembed model instead of the (paid, OpenAI-only)
+    default embedding engine. Runs entirely offline after a one-time model
+    download — needed because Groq offers no embeddings API. We monkeypatch the
+    factory in every module that already imported it by name.
+    """
+    from cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine import (
+        FastembedEmbeddingEngine,
+    )
+    engine = FastembedEmbeddingEngine(embedding_model=model, embedding_dimensions=dims)
+
+    def _factory():
+        return engine
+
+    import cognee.infrastructure.databases.vector.embeddings.get_embedding_engine as gee_mod
+    import cognee.infrastructure.databases.vector.get_vector_engine as gve_mod
+    gee_mod.get_embedding_engine = _factory
+    gve_mod.get_embedding_engine = _factory
+
+
 async def setup():
     """Initialise Cognee. Called once at app startup."""
+    global _graph_enabled
     import os
     try:
         from cognee.infrastructure.llm.config import get_llm_config
         llm_config = get_llm_config()
-        llm_config.llm_provider = os.getenv("LLM_PROVIDER", "openai")
-        llm_config.llm_model   = os.getenv("LLM_MODEL", "gpt-4o")
-        logger.info("Quorum memory layer initialised via Cognee ✓")
+
+        provider = os.getenv("LLM_PROVIDER", "groq")
+        model    = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+        override = os.getenv("COGNEE_GRAPH", "auto").lower()  # auto | on | off
+        llm_config.llm_model = model
+
+        if provider == "groq":
+            # Route Groq through the "custom" provider (GenericAPIAdapter honours
+            # llm_endpoint) + local Fastembed embeddings. NOTE: cognee 0.1.17's
+            # cognify still has a litellm path that ignores the endpoint and 401s
+            # against OpenAI, so the graph can't actually build on Groq — we leave
+            # it wired but disabled by default (set COGNEE_GRAPH=on to experiment).
+            llm_config.llm_provider = "custom"
+            llm_config.llm_api_key  = os.getenv("GROQ_API_KEY", "")
+            llm_config.llm_endpoint = "https://api.groq.com/openai/v1"
+            _use_local_embeddings("BAAI/bge-small-en-v1.5", 384)
+            _graph_enabled = (override == "on")
+        else:
+            # OpenAI (or another provider with a real key) can drive the graph.
+            llm_config.llm_provider = "openai"
+            llm_config.llm_api_key  = os.getenv("OPENAI_API_KEY", "")
+            if os.getenv("EMBEDDING_PROVIDER", "").lower() == "fastembed":
+                _use_local_embeddings("BAAI/bge-small-en-v1.5", 384)
+            _graph_enabled = override != "off" and bool(llm_config.llm_api_key)
+
+        logger.info(
+            f"Quorum memory layer initialised via Cognee ({provider}/{model}) — "
+            f"graph {'ENABLED' if _graph_enabled else 'disabled (registry-only)'}"
+        )
     except Exception as e:
         logger.warning(f"Cognee config warning (non-fatal): {e}")
 
@@ -86,9 +145,17 @@ Latency P99   : {dep.latency_at_deploy}ms
 Status        : {dep.status}
 """.strip()
 
-    await cognee.add(content, dataset_name="quorum_deployments")
-    await cognee.cognify()
-    logger.info(f"Remembered deployment {dep.id} ({dep.commit_sha[:7]})")
+    # Graph/vector ingestion is best-effort: the deployment registry above is the
+    # source of truth for the UI. Skip it entirely when the graph is disabled so
+    # ingestion stays instant (see _graph_enabled / setup()).
+    if not _graph_enabled:
+        return
+    try:
+        await cognee.add(content, dataset_name="quorum_deployments")
+        await cognee.cognify()
+        logger.info(f"Remembered deployment {dep.id} ({dep.commit_sha[:7]})")
+    except Exception as e:
+        logger.warning(f"Cognee graph ingestion skipped for {dep.id} (registry still updated): {e}")
 
 
 # ── remember_incident ─────────────────────────────────────────
@@ -122,9 +189,15 @@ the last agreed-upon safe state was {inc.rolled_back_to_deployment}
 at commit {inc.rolled_back_to_commit}.
 """.strip()
 
-    await cognee.add(content, dataset_name="quorum_incidents")
-    await cognee.cognify()
-    logger.info(f"Remembered incident {inc.id} → safe state: {inc.rolled_back_to_deployment}")
+    # Best-effort graph ingestion (see remember_deployment).
+    if not _graph_enabled:
+        return
+    try:
+        await cognee.add(content, dataset_name="quorum_incidents")
+        await cognee.cognify()
+        logger.info(f"Remembered incident {inc.id} → safe state: {inc.rolled_back_to_deployment}")
+    except Exception as e:
+        logger.warning(f"Cognee graph ingestion skipped for {inc.id}: {e}")
 
 
 # ── recall ────────────────────────────────────────────────────
@@ -183,6 +256,7 @@ async def forget(dataset: str = "quorum_incidents") -> dict:
 
 # ── graph data ────────────────────────────────────────────────
 async def get_graph_data() -> dict:
+    # Prefer the real Cognee graph when it actually built (needs a graph-capable LLM).
     try:
         from cognee.infrastructure.databases.graph import get_graph_engine
         engine = await get_graph_engine()
@@ -198,10 +272,83 @@ async def get_graph_data() -> dict:
                     "source": str(src), "target": str(tgt),
                     "label": attrs.get("relationship_name", "related") if isinstance(attrs, dict) else "related"
                 })
-        return {"nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges)}
+        if nodes:
+            return {"nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges)}
     except Exception as e:
         logger.warning(f"Graph extraction failed: {e}")
-        return {"nodes": [], "edges": [], "node_count": 0, "edge_count": 0}
+    # Cognee graph is empty (e.g. Groq can't run the graph pipeline) — synthesise a
+    # knowledge graph from the deployment registry so the view is still populated.
+    return _synthetic_graph_from_registry()
+
+
+def _synthetic_graph_from_registry(limit: int = 14) -> dict:
+    """
+    Derive a Knowledge Graph from the deployment registry. Each deployment links to
+    the engineer who shipped it, its commit, and the services it touched; an
+    INCIDENT deployment also links to the last stable state it was rolled back to.
+    Shared services/authors weave the deployments into one connected graph.
+    """
+    deployments = get_all_deployments()[-limit:]
+    if not deployments:
+        return _HARDCODED_GRAPH
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen: set[str] = set()
+
+    def node(nid: str, label: str, group: str):
+        if nid not in seen:
+            seen.add(nid)
+            nodes.append({"id": nid, "label": label, "group": group})
+
+    for i, d in enumerate(deployments):
+        is_incident = d.status == "INCIDENT"
+        node(d.id, d.id, "incident" if is_incident else "deployment")
+
+        pid = f"person::{d.author}"
+        node(pid, d.author, "person")
+        edges.append({"source": pid, "target": d.id, "label": "deployed"})
+
+        cid = f"commit::{d.commit_sha[:7]}"
+        node(cid, d.commit_sha[:7], "commit")
+        edges.append({"source": d.id, "target": cid, "label": "commit"})
+
+        for svc in d.services_affected[:3]:
+            sid = f"svc::{svc}"
+            node(sid, svc, "service")
+            edges.append({"source": d.id, "target": sid, "label": "affects"})
+
+        if is_incident:
+            # nearest prior STABLE deployment = the safe state to roll back to
+            for prior in reversed(deployments[:i]):
+                if prior.status == "STABLE":
+                    edges.append({"source": d.id, "target": prior.id, "label": "rolled back to"})
+                    break
+
+    return {"nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges)}
+
+
+# Static fallback used only when the registry is empty.
+_HARDCODED_GRAPH = {
+    "nodes": [
+        {"id": "dep-002", "label": "dep-002", "group": "incident"},
+        {"id": "dep-001", "label": "dep-001", "group": "deployment"},
+        {"id": "svc::payment-service", "label": "payment-service", "group": "service"},
+        {"id": "svc::queue-worker", "label": "queue-worker", "group": "service"},
+        {"id": "person::Sarah Chen", "label": "Sarah Chen", "group": "person"},
+        {"id": "cause::oom", "label": "queue OOM", "group": "cause"},
+        {"id": "res::rollback", "label": "rollback to dep-001", "group": "resolution"},
+    ],
+    "edges": [
+        {"source": "person::Sarah Chen", "target": "dep-002", "label": "deployed"},
+        {"source": "dep-002", "target": "svc::payment-service", "label": "affects"},
+        {"source": "dep-002", "target": "svc::queue-worker", "label": "affects"},
+        {"source": "dep-002", "target": "cause::oom", "label": "root cause"},
+        {"source": "dep-002", "target": "res::rollback", "label": "resolved by"},
+        {"source": "dep-002", "target": "dep-001", "label": "rolled back to"},
+    ],
+    "node_count": 7, "edge_count": 6,
+}
 
 
 # ── registry helpers ──────────────────────────────────────────

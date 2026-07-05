@@ -88,7 +88,12 @@ def refresh_access_token(token_str: str, db: Session):
     ).first()
     if not rt:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
-    if rt.expires_at < datetime.now(timezone.utc):
+    # SQLite (the default store) returns naive datetimes; normalise to UTC-aware
+    # before comparing so the token flow works across all configured databases.
+    expires_at = rt.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=401, detail="Refresh token expired")
 
     user = db.query(User).filter(User.id == rt.user_id, User.is_active == True).first()

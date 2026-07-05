@@ -45,6 +45,32 @@ export interface AuthUser {
 
 const BASE = "";
 
+// Single-flight token refresh. The dashboard fires several authed requests at
+// once; when the access token has expired they all 401 together. The backend
+// ROTATES refresh tokens (the old one is revoked on use), so if each request
+// refreshed independently only the first would succeed and the rest would get a
+// 401 and bounce the user to /auth/login. Sharing one in-flight refresh promise
+// means every concurrent caller retries with the same new token.
+let refreshPromise: Promise<string | null> | null = null;
+
+async function refreshAccessToken(): Promise<string | null> {
+  const auth = loadAuth();
+  if (!auth?.refresh_token) return null;
+  try {
+    const rr = await fetch(`${BASE}/api/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: auth.refresh_token }),
+    });
+    if (!rr.ok) return null;
+    const newTokens = await rr.json();
+    saveAuth(newTokens);
+    return newTokens.access_token as string;
+  } catch {
+    return null;
+  }
+}
+
 async function apiFetch(path: string, opts: RequestInit = {}) {
   const token = getAccessToken();
   const headers: Record<string, string> = {
@@ -54,29 +80,34 @@ async function apiFetch(path: string, opts: RequestInit = {}) {
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
   const res = await fetch(`${BASE}${path}`, { ...opts, headers });
+  if (res.status !== 401) return res;
 
-  // Auto-refresh if 401
-  if (res.status === 401) {
-    const auth = loadAuth();
-    if (auth?.refresh_token) {
-      try {
-        const rr = await fetch(`${BASE}/api/auth/refresh`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refresh_token: auth.refresh_token }),
-        });
-        if (rr.ok) {
-          const newTokens = await rr.json();
-          saveAuth(newTokens);
-          headers["Authorization"] = `Bearer ${newTokens.access_token}`;
-          return fetch(`${BASE}${path}`, { ...opts, headers });
-        }
-      } catch {}
-    }
-    clearAuth();
-    if (typeof window !== "undefined") window.location.href = "/auth/login";
+  // Coalesce concurrent refreshes into one call, then retry the original request.
+  if (!refreshPromise) {
+    refreshPromise = refreshAccessToken().finally(() => { refreshPromise = null; });
   }
+  const newToken = await refreshPromise;
+
+  if (newToken) {
+    headers["Authorization"] = `Bearer ${newToken}`;
+    return fetch(`${BASE}${path}`, { ...opts, headers });
+  }
+
+  clearAuth();
+  if (typeof window !== "undefined") window.location.href = "/auth/login";
   return res;
+}
+
+// List endpoints must never hand a non-array to a `.map()` in the UI. On an auth
+// failure/redirect or a server error the body is `{detail: ...}`, so coerce
+// anything that isn't an array to an empty list.
+async function jsonArray(r: Response): Promise<any[]> {
+  try {
+    const d = await r.json();
+    return Array.isArray(d) ? d : [];
+  } catch {
+    return [];
+  }
 }
 
 export const authApi = {
@@ -132,10 +163,19 @@ export const api = {
     const r = await apiFetch("/api/monitor/incident"); return r.json();
   },
   async getDeployments(): Promise<{ deployments: Deployment[] }> {
-    const r = await apiFetch("/api/monitor/deployments"); return r.json();
+    const r = await apiFetch("/api/monitor/deployments");
+    const d = await r.json().catch(() => ({}));
+    return { deployments: Array.isArray(d?.deployments) ? d.deployments : [] };
   },
   async getGraph() {
-    const r = await apiFetch("/api/graph"); return r.json();
+    const r = await apiFetch("/api/graph");
+    const d = await r.json().catch(() => ({}));
+    return {
+      nodes: Array.isArray(d?.nodes) ? d.nodes : [],
+      edges: Array.isArray(d?.edges) ? d.edges : [],
+      node_count: d?.node_count ?? 0,
+      edge_count: d?.edge_count ?? 0,
+    };
   },
   async simulateIncident(scenario: string) {
     const r = await apiFetch("/api/simulate/incident", {
@@ -161,7 +201,7 @@ export const api = {
 
 export const usersApi = {
   async list() {
-    const r = await apiFetch("/api/users/"); return r.json();
+    const r = await apiFetch("/api/users/"); return jsonArray(r);
   },
   async invite(data: { name: string; email: string; password: string; role: string }) {
     const r = await apiFetch("/api/users/invite", { method: "POST", body: JSON.stringify(data) });
@@ -176,13 +216,13 @@ export const usersApi = {
     const r = await apiFetch(`/api/users/${userId}`, { method: "DELETE" }); return r.json();
   },
   async auditLog() {
-    const r = await apiFetch("/api/users/audit-log"); return r.json();
+    const r = await apiFetch("/api/users/audit-log"); return jsonArray(r);
   },
 };
 
 export const sourcesApi = {
   async list() {
-    const r = await apiFetch("/api/sources/"); return r.json();
+    const r = await apiFetch("/api/sources/"); return jsonArray(r);
   },
   async create(data: { name: string; source_type: string; config: Record<string, string> }) {
     const r = await apiFetch("/api/sources/", { method: "POST", body: JSON.stringify(data) });
@@ -203,10 +243,10 @@ export const sourcesApi = {
 
 export const chatApi = {
   async getConversations() {
-    const r = await apiFetch("/api/chat/conversations"); return r.json();
+    const r = await apiFetch("/api/chat/conversations"); return jsonArray(r);
   },
   async getMessages(conversationId: string) {
-    const r = await apiFetch(`/api/chat/conversations/${conversationId}/messages`); return r.json();
+    const r = await apiFetch(`/api/chat/conversations/${conversationId}/messages`); return jsonArray(r);
   },
   async deleteConversation(conversationId: string) {
     const r = await apiFetch(`/api/chat/conversations/${conversationId}`, { method: "DELETE" });
@@ -269,7 +309,8 @@ export function createMetricsSocket(
   onIncident: (a: QuorumAnalysis | null) => void,
 ): () => void {
   const token = getAccessToken();
-  const wsUrl = `ws://localhost:8000/ws/metrics${token ? `?token=${token}` : ""}`;
+  const wsBase = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8080";
+  const wsUrl = `${wsBase}/ws/metrics${token ? `?token=${token}` : ""}`;
   let ws: WebSocket;
   let reconnectTimer: ReturnType<typeof setTimeout>;
   let alive = true;

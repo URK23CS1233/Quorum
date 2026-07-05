@@ -136,6 +136,20 @@ WS /ws/metrics  →  { type: "metrics", data: {...} }
 
 ---
 
+## Testing
+
+```bash
+# Backend — 220 pytest tests (offline; external services stubbed)
+cd backend && pip install -r requirements.txt && pytest
+
+# Frontend — 32 Vitest tests
+cd frontend && npm install && npm test
+```
+
+See [TESTING.md](TESTING.md) for the full layout and fixture design.
+
+---
+
 ## Stack
 
 - **Cognee** — graph-vector hybrid memory (the core)

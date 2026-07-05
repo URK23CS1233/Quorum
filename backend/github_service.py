@@ -39,6 +39,7 @@ async def fetch_recent_commits(owner: str, repo: str, limit: int = 10) -> list[D
             author = c["commit"]["author"]["name"]
             ts     = c["commit"]["author"]["date"]
 
+            files = []
             try:
                 detail = await client.get(
                     f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}",

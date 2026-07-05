@@ -1,8 +1,7 @@
 """
-Quorum — AI Chat Service
-Cognee-powered conversational memory. Every message is ingested into
-Cognee so context accumulates across sessions and references live
-deployment/incident knowledge.
+Quorum -- AI Chat Service
+General-purpose AI assistant with Cognee persistent memory.
+Every conversation is stored so context accumulates across sessions.
 """
 
 import json
@@ -16,21 +15,29 @@ import cognee_service
 from db_models import Conversation, Message
 from config import get_settings
 
-logger  = logging.getLogger(__name__)
+logger   = logging.getLogger(__name__)
 settings = get_settings()
 _oai: AsyncOpenAI | None = None
+
+_GROQ_BASE = "https://api.groq.com/openai/v1"
+_SSE_SEP   = "\n\n"
 
 
 def _client() -> AsyncOpenAI:
     global _oai
     if _oai is None:
-        _oai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        if settings.LLM_PROVIDER == "groq" and settings.GROQ_API_KEY:
+            _oai = AsyncOpenAI(api_key=settings.GROQ_API_KEY, base_url=_GROQ_BASE)
+        else:
+            _oai = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     return _oai
 
 
-# ── Conversation management ───────────────────────────────────
+def _sse(payload: dict) -> str:
+    return "data: " + json.dumps(payload) + _SSE_SEP
 
-def get_or_create_conversation(user_id: str, conversation_id: str | None, db: Session) -> Conversation:
+
+def get_or_create_conversation(user_id: str, conversation_id, db: Session):
     if conversation_id:
         conv = db.query(Conversation).filter(
             Conversation.id == conversation_id,
@@ -43,20 +50,18 @@ def get_or_create_conversation(user_id: str, conversation_id: str | None, db: Se
     return conv
 
 
-def list_conversations(user_id: str, db: Session) -> list[dict]:
+def list_conversations(user_id: str, db: Session) -> list:
     convs = (
         db.query(Conversation)
         .filter(Conversation.user_id == user_id)
         .order_by(Conversation.created_at.desc())
-        .limit(30)
-        .all()
+        .limit(30).all()
     )
     result = []
     for c in convs:
         last = c.messages[-1].content[:60] if c.messages else ""
         result.append({
-            "id": c.id, "title": c.title,
-            "last_message": last,
+            "id": c.id, "title": c.title, "last_message": last,
             "message_count": len(c.messages),
             "created_at": str(c.created_at),
             "updated_at": str(c.updated_at) if c.updated_at else str(c.created_at),
@@ -64,7 +69,7 @@ def list_conversations(user_id: str, db: Session) -> list[dict]:
     return result
 
 
-def get_conversation_messages(conversation_id: str, user_id: str, db: Session) -> list[dict]:
+def get_conversation_messages(conversation_id: str, user_id: str, db: Session) -> list:
     conv = db.query(Conversation).filter(
         Conversation.id == conversation_id,
         Conversation.user_id == user_id,
@@ -89,80 +94,80 @@ def delete_conversation(conversation_id: str, user_id: str, db: Session) -> bool
     return True
 
 
-# ── Streaming chat ────────────────────────────────────────────
-
-async def chat_stream(
-    user_id: str,
-    conversation_id: str,
-    user_message: str,
-    db: Session,
-) -> AsyncGenerator[str, None]:
-    """Stream an AI response with Cognee memory context. Yields SSE data lines."""
+async def chat_stream(user_id, conversation_id, user_message, db) -> AsyncGenerator[str, None]:
+    """Stream an AI response with persistent Cognee memory. Yields SSE frames."""
 
     conv = get_or_create_conversation(user_id, conversation_id, db)
 
-    # 1. Save user message
     user_msg = Message(conversation_id=conv.id, role="user", content=user_message)
     db.add(user_msg); db.commit()
 
-    # 2. Recall Cognee memory — deployment/incident graph + conversation history
-    memory_context: dict = {"answer": "", "insights": []}
+    # Recall relevant memory from Cognee graph
+    memory_context = {"answer": "", "insights": [], "summaries": []}
     try:
         memory_context = await cognee_service.recall(
-            cpu=0.0, error_rate=0.0, latency=0.0,
-            anomaly_desc=user_message,
+            cpu=0.0, error_rate=0.0, latency=0.0, anomaly_desc=user_message,
         )
     except Exception as e:
-        logger.warning(f"Cognee recall failed in chat: {e}")
+        logger.warning("Cognee recall skipped: %s", e)
 
-    memory_text = memory_context.get("answer", "")
-    insights    = memory_context.get("insights", [])
-    insight_str = "\n".join(
-        f"  {i.get('subject')} → {i.get('relationship')} → {i.get('object')}"
-        for i in insights[:5]
-    ) if insights else "  None yet"
+    memory_text  = (memory_context.get("answer") or "").strip()
+    insights     = memory_context.get("insights") or []
 
-    # 3. Build conversation history (last 12 messages for context window)
+    insight_lines = [
+        "  - " + str(i.get("subject","?")) + " -> " + str(i.get("relationship","?")) + " -> " + str(i.get("object","?"))
+        for i in insights[:4] if i.get("subject") or i.get("object")
+    ]
+
+    # In-session conversation history (last 14 turns)
     history = [
         {"role": m.role, "content": m.content}
-        for m in conv.messages[-12:]
+        for m in conv.messages[-14:]
         if m.id != user_msg.id
     ]
 
+    # Build memory block
+    memory_parts = []
+    if memory_text:
+        memory_parts.append("What Quorum remembers relevant to this:\n" + memory_text)
+    if insight_lines:
+        memory_parts.append("Graph connections:\n" + "\n".join(insight_lines))
+
     deployments = cognee_service.get_all_deployments()
-    dep_summary = "\n".join(
-        f"  {d.id}: {d.commit_sha[:8]} — {d.commit_message[:60]} [{d.status}]"
-        for d in deployments[-6:]
-    ) if deployments else "  None ingested yet"
+    keywords = user_message.lower().split()
+    relevant_deps = [
+        d for d in deployments
+        if any(kw in (d.id + d.author + d.commit_message + " ".join(d.services_affected)).lower()
+               for kw in keywords if len(kw) > 3)
+    ]
+    if relevant_deps:
+        dep_lines = "\n".join(
+            "  - [" + d.status + "] " + d.id + ": " + d.commit_message[:80]
+            for d in relevant_deps[:4]
+        )
+        memory_parts.append("Relevant deployments:\n" + dep_lines)
 
-    system_prompt = f"""You are Quorum AI — an expert production incident prevention assistant with deep memory of this system's deployment history, past incidents, and operational patterns.
+    memory_block = "\n\n".join(memory_parts) if memory_parts else "(no prior memory relevant to this message)"
 
-Your knowledge comes from Cognee's hybrid graph-vector memory, which stores causal chains between deployments, incidents, root causes, and safe states.
+    system_prompt = (
+        "You are a helpful, knowledgeable AI assistant built into Quorum, a production reliability platform. "
+        "You have two defining qualities:\n\n"
+        "GENERAL INTELLIGENCE: Answer any question on any topic -- coding, writing, math, analysis, "
+        "advice, creative work, explanations. You are as capable and conversational as the best AI assistants. "
+        "Never say you cannot help or that you lack knowledge -- engage with everything.\n\n"
+        "PERSISTENT MEMORY: Quorum stores all conversations and system events in Cognee's knowledge graph. "
+        "You can recall what was discussed in previous sessions. When memory surfaces something relevant, "
+        "weave it in naturally: 'Based on what we discussed before...', 'I remember you mentioned...', "
+        "'According to your deployment history...'. Only reference memory when it genuinely helps -- "
+        "don't force it.\n\n"
+        "=== MEMORY FOR THIS MESSAGE ===\n" + memory_block + "\n\n"
+        "=== STYLE ===\n"
+        "Conversational for casual questions, precise and structured for technical ones. "
+        "Use markdown and code blocks when they improve clarity. "
+        "Be thorough but never pad. Match length to complexity. "
+        "Never start with 'As an AI' or similar hedges -- just answer."
+    )
 
-=== CURRENT COGNEE MEMORY RECALL ===
-{memory_text or "No matching memory found yet. Answer based on general expertise."}
-
-=== GRAPH INSIGHTS (entity relationships) ===
-{insight_str}
-
-=== RECENT DEPLOYMENTS IN MEMORY ===
-{dep_summary}
-
-=== YOUR CAPABILITIES ===
-- Recall which deployments caused past incidents and why
-- Identify the safe rollback state for any scenario
-- Analyze patterns across multiple incidents
-- Explain root causes with causal chain reasoning
-- Answer natural language questions about system history
-
-=== INSTRUCTIONS ===
-- Be specific: cite deployment IDs (dep-XXX), commit SHAs, and incident IDs when relevant
-- Explain your reasoning based on graph relationships, not guesses
-- If memory is sparse, say so and suggest seeding more incident data
-- Keep responses concise and actionable for on-call engineers
-- Format structured data (deployment lists, comparisons) in markdown tables"""
-
-    # 4. Stream from OpenAI
     full_response = ""
     tokens_used   = 0
 
@@ -174,50 +179,42 @@ Your knowledge comes from Cognee's hybrid graph-vector memory, which stores caus
                 *history,
                 {"role": "user", "content": user_message},
             ],
-            stream=True,
-            max_tokens=1500,
-            temperature=0.3,
+            stream=True, max_tokens=2048, temperature=0.7,
         )
-
         async for chunk in stream:
             delta = chunk.choices[0].delta.content if chunk.choices else None
             if delta:
                 full_response += delta
-                yield f"data: {json.dumps({'text': delta, 'conversation_id': conv.id})}\n\n"
-
-        tokens_used = len(full_response.split()) * 2  # rough estimate
+                yield _sse({"text": delta, "conversation_id": conv.id})
+        tokens_used = len(full_response.split()) * 2
 
     except Exception as e:
-        error_msg = f"I encountered an error: {e}. Please check that OPENAI_API_KEY is set in your .env."
-        full_response = error_msg
-        yield f"data: {json.dumps({'text': error_msg, 'conversation_id': conv.id})}\n\n"
+        logger.error("LLM error: %s", e)
+        msg = "LLM error: " + str(e) + ". Check GROQ_API_KEY in backend/.env."
+        full_response = msg
+        yield _sse({"text": msg, "conversation_id": conv.id})
 
-    # 5. Save assistant response
-    ai_msg = Message(
-        conversation_id=conv.id, role="assistant",
-        content=full_response, tokens_used=tokens_used,
-    )
+    ai_msg = Message(conversation_id=conv.id, role="assistant",
+                     content=full_response, tokens_used=tokens_used)
     db.add(ai_msg)
 
-    # 6. Update conversation title from first message
     if conv.title == "New conversation" and len(conv.messages) <= 2:
-        conv.title = user_message[:50] + ("…" if len(user_message) > 50 else "")
+        conv.title = user_message[:50] + ("..." if len(user_message) > 50 else "")
 
     db.commit()
 
-    # 7. Ingest conversation into Cognee memory (non-blocking)
+    # Ingest into Cognee so future sessions can recall this conversation
     try:
         import cognee
-        mem = f"QUORUM CHAT LOG\nUser: {user_message}\nQuorum AI: {full_response[:500]}"
-        await cognee.add(mem, dataset_name=f"quorum_chat_{user_id[:8]}")
+        mem = "USER SAID: " + user_message + "\nASSISTANT REPLIED: " + full_response[:1000]
+        await cognee.add(mem, dataset_name="quorum_chat_" + user_id[:8])
         await cognee.cognify()
     except Exception as e:
-        logger.debug(f"Chat memory ingestion skipped: {e}")
+        logger.debug("Memory ingestion skipped: %s", e)
 
-    yield f"data: {json.dumps({'done': True, 'conversation_id': conv.id, 'tokens': tokens_used})}\n\n"
+    yield _sse({"done": True, "conversation_id": conv.id, "tokens": tokens_used})
 
 
-# ── Token usage stats ─────────────────────────────────────────
 def get_token_stats(user_id: str, db: Session) -> dict:
     messages = (
         db.query(Message)
