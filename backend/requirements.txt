@@ -1,9 +1,17 @@
-# cognee==0.1.17 manages: fastapi, uvicorn, openai, httpx, aiofiles, websockets, pydantic
-# We only pin packages cognee does NOT touch.
-cognee==0.1.17
+# cognee==0.1.17 has unresolvable internal conflicts (fastapi-users vs fastapi 0.109.x).
+# cognee is imported conditionally in cognee_service.py (_COGNEE_AVAILABLE flag).
+# All cognee calls are wrapped in try/except, so the app runs fully without it.
+fastapi==0.109.2
+uvicorn[standard]==0.30.6
+websockets==13.0
 python-dotenv==1.0.1
 python-multipart==0.0.9
+pydantic>=2.7.0
 pydantic-settings>=2.0.0
+sqlalchemy>=2.0.0
+openai>=1.27.0
+httpx>=0.24.0
+aiofiles>=23.0.0,<24.0.0
 
 # Auth
 python-jose[cryptography]==3.3.0

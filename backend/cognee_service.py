@@ -12,13 +12,23 @@ import os
 # eu.i.posthog.com read-timeouts and stalls the request). Must be set before import.
 os.environ.setdefault("TELEMETRY_DISABLED", "1")
 
-import cognee
 import json
 import logging
 import pathlib
 from typing import Any
-from cognee.api.v1.search import SearchType
 from models import Deployment, Incident
+
+# cognee is optional — if it can't be installed (dependency conflicts in some
+# environments) the app runs in registry-only mode. All graph features degrade
+# gracefully via try/except throughout this module.
+try:
+    import cognee
+    from cognee.api.v1.search import SearchType
+    _COGNEE_AVAILABLE = True
+except Exception:
+    cognee = None  # type: ignore
+    SearchType = None  # type: ignore
+    _COGNEE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +92,9 @@ def _use_local_embeddings(model: str, dims: int) -> None:
 async def setup():
     """Initialise Cognee. Called once at app startup."""
     global _graph_enabled
+    if not _COGNEE_AVAILABLE:
+        logger.info("Quorum memory layer: cognee not installed — registry-only mode")
+        return
     import os
     try:
         from cognee.infrastructure.llm.config import get_llm_config
@@ -214,24 +227,25 @@ async def recall(cpu: float, error_rate: float, latency: float, anomaly_desc: st
         "safe_deployment_hint": None, "safe_commit_hint": None,
     }
 
-    try:
-        r = await cognee.search(query, search_type=SearchType.GRAPH_COMPLETION)
-        results["answer"] = _extract_text(r)
-    except Exception as e:
-        logger.warning(f"GRAPH_COMPLETION failed: {e}")
-        results["answer"] = "No matching incident pattern found yet. Seed more incident history."
+    if _COGNEE_AVAILABLE:
+        try:
+            r = await cognee.search(query, search_type=SearchType.GRAPH_COMPLETION)
+            results["answer"] = _extract_text(r)
+        except Exception as e:
+            logger.warning(f"GRAPH_COMPLETION failed: {e}")
+            results["answer"] = "No matching incident pattern found yet. Seed more incident history."
 
-    try:
-        r = await cognee.search(query, search_type=SearchType.INSIGHTS)
-        results["insights"] = _extract_insights(r)
-    except Exception as e:
-        logger.warning(f"INSIGHTS failed: {e}")
+        try:
+            r = await cognee.search(query, search_type=SearchType.INSIGHTS)
+            results["insights"] = _extract_insights(r)
+        except Exception as e:
+            logger.warning(f"INSIGHTS failed: {e}")
 
-    try:
-        r = await cognee.search(query, search_type=SearchType.SUMMARIES)
-        results["summaries"] = _extract_summaries(r)
-    except Exception as e:
-        logger.warning(f"SUMMARIES failed: {e}")
+        try:
+            r = await cognee.search(query, search_type=SearchType.SUMMARIES)
+            results["summaries"] = _extract_summaries(r)
+        except Exception as e:
+            logger.warning(f"SUMMARIES failed: {e}")
 
     for dep_id, dep in _get_registry().items():
         if dep_id in results["answer"] or dep.commit_sha[:7] in results["answer"]:
@@ -244,13 +258,18 @@ async def recall(cpu: float, error_rate: float, latency: float, anomaly_desc: st
 
 # ── improve ───────────────────────────────────────────────────
 async def improve() -> dict:
-    await cognee.cognify()
+    if _COGNEE_AVAILABLE and _graph_enabled:
+        await cognee.cognify()
     return {"status": "ok", "message": "Quorum memory graph strengthened."}
 
 
 # ── forget ────────────────────────────────────────────────────
 async def forget(dataset: str = "quorum_incidents") -> dict:
-    await cognee.prune.prune_data()
+    if _COGNEE_AVAILABLE:
+        try:
+            await cognee.prune.prune_data()
+        except Exception as e:
+            logger.warning(f"Cognee prune skipped: {e}")
     return {"status": "ok", "dataset": dataset}
 
 
