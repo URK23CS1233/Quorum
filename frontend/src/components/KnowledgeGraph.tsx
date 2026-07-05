@@ -109,6 +109,7 @@ export default function KnowledgeGraph({ nodes, edges }: Props) {
           .on("start", (e, d: any) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
           .on("drag",  (e, d: any) => { d.fx = e.x; d.fy = e.y; })
           .on("end",   (e, d: any) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+          as any
       )
       .on("mouseenter", (e, d) => setTooltip({ label: d.label, x: e.clientX, y: e.clientY }))
       .on("mouseleave", () => setTooltip(null));
