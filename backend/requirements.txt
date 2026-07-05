@@ -4,16 +4,13 @@ websockets==13.0
 cognee==0.1.17
 python-dotenv==1.0.1
 python-multipart==0.0.9
-pydantic==2.9.2
 pydantic-settings==2.4.0
-httpx==0.27.2
-openai==1.51.0
-aiofiles==23.2.1     # cognee 0.1.17 requires aiofiles<24.0.0
+aiofiles==23.2.1
 
 # Auth
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-bcrypt==4.0.1        # pinned: passlib 1.7.4 is incompatible with bcrypt>=4.1
+bcrypt==4.0.1
 
 # Database
 sqlalchemy==2.0.35
