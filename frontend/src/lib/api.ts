@@ -329,3 +329,6 @@ export function createMetricsSocket(
   }
   connect();
   return () => {
+  alive = false; clearTimeout(reconnectTimer); ws?.close();
+  };
+}
