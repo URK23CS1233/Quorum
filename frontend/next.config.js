@@ -6,4 +6,10 @@ const nextConfig = {
     return [
       {
         source: "/api/:path*",
-        destination: `${backendUrl}/
+        destination: backendUrl + "/api/:path*",
+      },
+    ];
+  },
+};
+
+module.exports = nextConfig;
